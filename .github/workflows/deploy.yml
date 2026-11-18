@@ -1,0 +1,85 @@
+name: Deploy CCM public JSON
+run-name: CCM publish ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Expected approved publication revision (blank: latest)"
+        required: false
+        type: string
+      request_id:
+        description: "Caller run ID and attempt (blank: manual publication)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ccm-pages-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # An unmerged branch/PR must not gain a publication path through dispatch.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      CCM_API_BASE_URL: ${{ vars.CCM_API_BASE_URL }}
+      CCM_DEPLOY_TOKEN: ${{ secrets.CCM_DEPLOY_TOKEN }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Recover an abandoned publisher only after conclusive termination
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ccm_recover.py
+
+      - name: Read and validate approved snapshot; record attempt in D1
+        id: prepare
+        env:
+          REQUESTED_REVISION: ${{ inputs.revision }}
+        run: python3 scripts/ccm_deploy.py prepare
+
+      - name: Check public file allowlist and unchanged bytes
+        run: python3 scripts/ccm_deploy.py check-artifact
+
+      - name: Upload Pages artifact (retain one day)
+        id: artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public-artifact
+          retention-days: 1
+
+      - name: Revalidate revision immediately before deployment
+        id: authorize
+        run: python3 scripts/ccm_deploy.py authorize
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Verify both published URLs (2 / 10 / 30 minutes)
+        id: verify
+        env:
+          PAGE_URL: ${{ steps.deploy.outputs.page_url }}
+        run: python3 scripts/ccm_deploy.py verify
+
+      - name: Record exact attempt result in D1
+        if: always()
+        env:
+          ARTIFACT_OUTCOME: ${{ steps.artifact.outcome }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+        run: python3 scripts/ccm_deploy.py finish
